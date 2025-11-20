@@ -1,0 +1,8 @@
+pyside6==6.7.2
+shiboken6==6.7.2
+pyqtgraph==0.13.6
+qasync==0.27.1
+pyserial==3.5
+pyserial-asyncio==0.6
+# Para MAVLink real (opcional; mejor con Python 3.11):
+# mavsdk==2.2.0
