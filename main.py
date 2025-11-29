@@ -9,6 +9,16 @@ from qasync import QEventLoop
 from interfaz.main_window import MainWindow
 
 
+def resource_path(relative: str) -> Path:
+    """
+    Devuelve la ruta absoluta a un recurso, tanto en modo normal
+    como cuando el programa está empacado con PyInstaller (onefile).
+    """
+    # OJO: siempre convertimos a Path, aunque _MEIPASS sea str
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base_path / relative
+
+
 def tema_negro_naranja(app: QApplication):
     app.setStyle("Fusion")
     pal = QPalette()
@@ -44,16 +54,20 @@ def main():
     app = QApplication(sys.argv)
     tema_negro_naranja(app)
 
+    # Event loop async de qasync
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
 
-    root = Path(__file__).resolve().parent
-    logo_file = root / "assets" / "uav_iasa_logo.png"
+    # Logo (asegúrate de que uav_iasa_logo.png está junto a main.py)
+    logo_file = resource_path("uav_iasa_logo.png")
     logo_path = str(logo_file) if logo_file.exists() else None
 
     win = MainWindow(logo_path=logo_path)
+
+    # Icono de la ventana / barra de tareas
     if logo_path:
         app.setWindowIcon(QIcon(logo_path))
+
     win.show()
 
     with loop:
@@ -62,3 +76,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

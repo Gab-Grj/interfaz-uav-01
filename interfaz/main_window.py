@@ -8,6 +8,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple
+from math import sqrt, atan2, radians, sin, cos, pi  # <- para HUD/energía/FPV
 
 from PySide6.QtCore import (
     Qt,
@@ -51,6 +52,9 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QDialog,
     QGraphicsOpacityEffect,
+    QCheckBox,
+    QSpinBox,
+    QDoubleSpinBox,
 )
 
 import pyqtgraph as pg
@@ -75,7 +79,7 @@ THEMES = {
         "text_main": "#F5F5FF",
         "text_secondary": "#8E8EAA",
         "text_title": "#FFFFFF",
-        "accent_color": "#FF8A00",   # naranja principal
+        "accent_color": "#FF8A00",   # se sobreescribe según configuración
         "accent_soft": "#FFB84D",
         "danger_color": "#FF453A",
         "warning_color": "#FFD60A",
@@ -107,6 +111,21 @@ THEMES = {
         "console_bg": "#FFFFFF",
         "button_secondary_bg": "#E5E7EB",
     },
+}
+
+# paletas de color principal configurables
+ACCENT_COLOR_OPTIONS = {
+    "Rojo": ("#FF3B30", "#FF6961"),
+    "Azul": ("#0A84FF", "#5AC8FA"),
+    "Amarillo": ("#FFD60A", "#FFE566"),
+    "Verde": ("#30D158", "#5CD85C"),
+    "Naranja": ("#FF8A00", "#FFB84D"),
+    "Morado": ("#BF5AF2", "#D0A2F7"),
+    "Rosa": ("#FF2D55", "#FF6B81"),
+    "Marrón": ("#A2845E", "#C8AD7F"),
+    "Blanco": ("#FFFFFF", "#F5F5F5"),
+    "Negro": ("#000000", "#333333"),
+    "Gris": ("#8E8E93", "#C7C7CC"),
 }
 
 
@@ -285,6 +304,8 @@ QTableWidget::item:selected {{
 pg.setConfigOption("antialias", True)
 pg.setConfigOption("background", THEMES["dark"]["graph_bg"])
 pg.setConfigOption("foreground", THEMES["dark"]["text_main"])
+
+G0 = 9.80665  # gravedad estándar para energía específica
 
 # ----------------------------------------------------------------------
 # WIDGETS PERSONALIZADOS (batería, barras de señal, cámara, HUD)
@@ -566,8 +587,13 @@ class CameraWidget(QLabel):
 
 class AttitudeIndicator(QWidget):
     """
-    Horizonte artificial que representa roll y pitch.
-    Se dibuja un círculo, cielo, tierra y marcas de referencia.
+    Horizonte artificial que representa roll y pitch, con:
+    - Escala de pitch
+    - Marcas de bank en el anillo
+    - Indicador de slip
+    - Flight Path Vector (FPV)
+    - Indicador simple de energía (ganando/perdiendo)
+    - Mini plano de coordenadas 3D (X/Y/Z) que acompaña a la actitud
     """
 
     def __init__(self, parent=None, theme: str = "dark"):
@@ -575,16 +601,49 @@ class AttitudeIndicator(QWidget):
         self.theme = theme
         self.roll = 0.0
         self.pitch = 0.0
+        self.yaw = 0.0
+
+        # FPV y slip
+        self.fpv_pitch = 0.0
+        self.fpv_yaw = 0.0
+        self.has_fpv = False
+        self.slip = 0.0          # [-1,1] izquierda-derecha
+        self.energy_trend = 0    # -1: perdiendo, 0: estable, 1: ganando
+
         self.setMinimumSize(220, 220)
 
     def set_theme(self, theme: str):
         self.theme = theme
         self.update()
 
-    def set_attitude(self, roll_deg: float, pitch_deg: float):
-        """Actualiza los valores de actitud (en grados)."""
+    def set_attitude(
+        self,
+        roll_deg: float,
+        pitch_deg: float,
+        yaw_deg: Optional[float] = None,
+        fpv_pitch_deg: Optional[float] = None,
+        fpv_yaw_deg: Optional[float] = None,
+        slip: Optional[float] = None,
+        energy_trend: Optional[int] = None,
+    ):
+        """Actualiza valores de actitud + FPV + slip + energía."""
         self.roll = roll_deg or 0.0
         self.pitch = pitch_deg or 0.0
+        if yaw_deg is not None:
+            self.yaw = yaw_deg or 0.0
+
+        if fpv_pitch_deg is not None and fpv_yaw_deg is not None:
+            self.fpv_pitch = fpv_pitch_deg
+            self.fpv_yaw = fpv_yaw_deg
+            self.has_fpv = True
+        else:
+            self.has_fpv = False
+
+        if slip is not None:
+            self.slip = max(-1.0, min(1.0, slip))
+        if energy_trend is not None:
+            self.energy_trend = int(max(-1, min(1, energy_trend)))
+
         self.update()
 
     def paintEvent(self, event):
@@ -602,13 +661,14 @@ class AttitudeIndicator(QWidget):
         p.setPen(QPen(QColor(t["border_color"]), 1.8))
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 16, 16)
 
-        # Transformaciones
+        # ------------------ FONDO CIELO/TIERRA + ESCALA PITCH ------------------
         p.save()
         p.translate(center)
         p.rotate(-self.roll)
 
-        # Pitch -> desplazamiento vertical
-        pitch_norm = max(-45.0, min(45.0, self.pitch)) / 45.0
+        # Pitch -> desplazamiento vertical de horizonte
+        pitch_clamp = max(-45.0, min(45.0, self.pitch))
+        pitch_norm = pitch_clamp / 45.0
         y_offset = pitch_norm * radius * 0.6
 
         # Cielo y tierra
@@ -624,11 +684,39 @@ class AttitudeIndicator(QWidget):
         p.setBrush(ground_color)
         p.drawRect(ground_rect)
 
+        # Escala de pitch (cada 10° entre -30 y +30)
+        p.setPen(QPen(QColor(t["text_main"]), 1.5))
+        pitch_scale = radius * 0.6 / 45.0  # px por grado
+        for ang in range(-30, 31, 10):
+            if ang == 0:
+                continue
+            y_mark = y_offset - ang * pitch_scale
+            if abs(y_mark) > radius * 1.2:
+                continue
+            # línea centrada
+            half_w = radius * (0.35 if abs(ang) % 20 == 0 else 0.25)
+            p.drawLine(QPointF(-half_w, y_mark), QPointF(half_w, y_mark))
+            # texto pitch
+            txt = f"{ang:+d}"
+            p.setFont(QFont("Segoe UI", 7))
+            p.drawText(
+                QRectF(-half_w - 24, y_mark - 6, 20, 12),
+                Qt.AlignRight | Qt.AlignVCenter,
+                txt,
+            )
+            p.drawText(
+                QRectF(half_w + 4, y_mark - 6, 20, 12),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                txt,
+            )
+
         # Línea de horizonte
         p.setPen(QPen(QColor(t["text_main"]), 2))
         p.drawLine(QPointF(-radius * 2, y_offset), QPointF(radius * 2, y_offset))
 
         p.restore()
+
+        # ------------------ ANILLO PRINCIPAL + MARCAS DE BANK ------------------
         p.translate(center)
 
         # Círculo principal
@@ -636,14 +724,143 @@ class AttitudeIndicator(QWidget):
         p.setBrush(Qt.NoBrush)
         p.drawEllipse(QPointF(0, 0), radius * 0.9, radius * 0.9)
 
-        # Avión
+        # Marcas de bank
+        bank_pen = QPen(QColor(t["text_secondary"]), 1.5, Qt.SolidLine, Qt.RoundCap)
+        p.setPen(bank_pen)
+        for ang in [-60, -45, -30, -20, -10, 10, 20, 30, 45, 60]:
+            a = radians(ang)
+            outer_r = radius * 0.9
+            if abs(ang) in (30, 45):
+                inner_r = outer_r - radius * 0.11
+            elif abs(ang) == 60:
+                inner_r = outer_r - radius * 0.07
+            else:
+                inner_r = outer_r - radius * 0.07
+            x1 = inner_r * sin(a)
+            y1 = -inner_r * cos(a)
+            x2 = outer_r * sin(a)
+            y2 = -outer_r * cos(a)
+            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        # Triángulo índice superior (0° bank)
+        top_y = -radius * 0.9
+        tri_w = radius * 0.10
+        tri_h = radius * 0.06
+        bank_index = QPolygonF(
+            [
+                QPointF(0, top_y - tri_h),
+                QPointF(-tri_w / 2, top_y),
+                QPointF(tri_w / 2, top_y),
+            ]
+        )
+        p.setBrush(QColor(t["text_main"]))
+        p.setPen(Qt.NoPen)
+        p.drawPolygon(bank_index)
+
+        # ------------------ SÍMBOLO DEL AVIÓN ------------------
         aircraft_pen = QPen(QColor(t["accent_color"]), 3, Qt.SolidLine, Qt.RoundCap)
         p.setPen(aircraft_pen)
+        p.setBrush(Qt.NoBrush)
         p.drawLine(-radius * 0.4, 0, -radius * 0.1, 0)
         p.drawLine(radius * 0.1, 0, radius * 0.4, 0)
         p.drawEllipse(QPointF(0, 0), 4, 4)
 
-        # Texto de roll/pitch
+        # ------------------ FLIGHT PATH VECTOR (FPV) ------------------
+        if self.has_fpv:
+            # Diferencia yaw entre trayectoria y actitud
+            yaw_diff = self.fpv_yaw - self.yaw
+            # wrap a [-180,180]
+            while yaw_diff > 180:
+                yaw_diff -= 360
+            while yaw_diff < -180:
+                yaw_diff += 360
+
+            max_pitch = 30.0
+            max_yaw_diff = 30.0
+            fpv_pitch_clamp = max(-max_pitch, min(max_pitch, self.fpv_pitch))
+            yaw_diff_clamp = max(-max_yaw_diff, min(max_yaw_diff, yaw_diff))
+
+            x_fpv = (yaw_diff_clamp / max_yaw_diff) * radius * 0.45
+            y_fpv = -(fpv_pitch_clamp / max_pitch) * radius * 0.45
+
+            fpv_color = QColor(t["accent_soft"])
+            p.setPen(QPen(fpv_color, 2, Qt.SolidLine, Qt.RoundCap))
+            p.setBrush(Qt.NoBrush)
+            # círculo FPV
+            p.drawEllipse(QPointF(x_fpv, y_fpv), 6, 6)
+            # alitas FPV
+            p.drawLine(
+                QPointF(x_fpv - 12, y_fpv),
+                QPointF(x_fpv - 4, y_fpv),
+            )
+            p.drawLine(
+                QPointF(x_fpv + 4, y_fpv),
+                QPointF(x_fpv + 12, y_fpv),
+            )
+
+        # ------------------ INDICADOR DE SLIP ------------------
+        bar_y = radius * 0.65
+        bar_w = radius * 0.7
+        bar_h = radius * 0.08
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(t["bg_card"]))
+        slip_rect = QRectF(-bar_w / 2, bar_y - bar_h / 2, bar_w, bar_h)
+        p.drawRoundedRect(slip_rect, bar_h / 2, bar_h / 2)
+
+        p.setPen(QPen(QColor(t["border_color"]), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(slip_rect, bar_h / 2, bar_h / 2)
+
+        ball_r = bar_h * 0.45
+        slip_norm = max(-1.0, min(1.0, self.slip))
+        ball_x = slip_rect.center().x() + slip_norm * (bar_w / 2 - ball_r - 2)
+        if abs(slip_norm) > 0.7:
+            ball_color = QColor(t["danger_color"])
+        else:
+            ball_color = QColor(t["accent_color"])
+        p.setBrush(ball_color)
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(QPointF(ball_x, slip_rect.center().y()), ball_r, ball_r)
+
+        # ------------------ INDICADOR DE ENERGÍA ------------------
+        # Barra vertical simple en el lado derecho del anillo.
+        energy_x = radius * 0.9
+        energy_h = radius * 0.4
+        p.setPen(QPen(QColor(t["border_color"]), 1))
+        p.drawLine(
+            QPointF(energy_x, -energy_h / 2),
+            QPointF(energy_x, energy_h / 2),
+        )
+
+        # Flecha según tendencia de energía
+        if self.energy_trend != 0:
+            arrow_color = (
+                QColor(t["success_color"]) if self.energy_trend > 0 else QColor(t["danger_color"])
+            )
+            p.setBrush(arrow_color)
+            p.setPen(Qt.NoPen)
+            if self.energy_trend > 0:
+                # flecha hacia arriba
+                tri = QPolygonF(
+                    [
+                        QPointF(energy_x, -energy_h / 2),
+                        QPointF(energy_x - 6, -energy_h / 2 + 10),
+                        QPointF(energy_x + 6, -energy_h / 2 + 10),
+                    ]
+                )
+            else:
+                # flecha hacia abajo
+                tri = QPolygonF(
+                    [
+                        QPointF(energy_x, energy_h / 2),
+                        QPointF(energy_x - 6, energy_h / 2 - 10),
+                        QPointF(energy_x + 6, energy_h / 2 - 10),
+                    ]
+                )
+            p.drawPolygon(tri)
+
+        # ------------------ TEXTO ROLL/PITCH ------------------
         p.setPen(QColor(t["text_secondary"]))
         p.setFont(QFont("Segoe UI", 9))
         p.drawText(
@@ -651,6 +868,48 @@ class AttitudeIndicator(QWidget):
             Qt.AlignCenter,
             f"ROLL {self.roll:+.1f}°   PITCH {self.pitch:+.1f}°",
         )
+
+        # ------------------ MINI PLANO DE COORDENADAS 3D ------------------
+        p.save()
+        p.resetTransform()
+        p.setRenderHint(QPainter.Antialiasing)
+
+        margin = 18
+        axis_center = QPointF(margin + 24, self.height() - margin - 28)
+        axis_len = 18.0
+
+        yaw_rad = radians(self.yaw)
+        pitch_rad = radians(self.pitch)
+
+        # Ejes X/Y en el plano horizontal (rotan con yaw)
+        x_dir = QPointF(axis_len * cos(yaw_rad), -axis_len * sin(yaw_rad))
+        y_dir = QPointF(axis_len * sin(yaw_rad), axis_len * cos(yaw_rad))
+
+        # Eje Z proyectado (afectado por pitch)
+        z_dir = QPointF(0, -axis_len * cos(pitch_rad))
+
+        # Fondo suave del widget de coordenadas
+        bg_color = QColor(0, 0, 0, 90) if self.theme == "dark" else QColor(255, 255, 255, 160)
+        p.setBrush(bg_color)
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(axis_center.x() - 24, axis_center.y() - 24, 48, 48), 8, 8)
+
+        # Ejes
+        p.setPen(QPen(QColor(t["accent_color"]), 1.5))
+        p.drawLine(axis_center, axis_center + x_dir)
+        p.setPen(QPen(QColor("#0A84FF"), 1.3))
+        p.drawLine(axis_center, axis_center + y_dir)
+        p.setPen(QPen(QColor(t["success_color"]), 1.3))
+        p.drawLine(axis_center, axis_center + z_dir)
+
+        # Etiquetas X/Y/Z
+        p.setFont(QFont("Segoe UI", 7))
+        p.setPen(QColor(t["text_main"]))
+        p.drawText(axis_center + x_dir + QPointF(3, 0), "X")
+        p.drawText(axis_center + y_dir + QPointF(3, 0), "Y")
+        p.drawText(axis_center + z_dir + QPointF(3, 0), "Z")
+
+        p.restore()
 
         p.end()
 
@@ -1005,9 +1264,11 @@ class MainWindow(QMainWindow):
     Ventana principal de la interfaz de telemetría UAV-IASA UNAM.
     Contiene:
       - Dashboard de vuelo (cámara, HUD, estado rápido).
+      - Mapa / navegación.
       - Gráficas individuales.
       - Historial de telemetría.
       - Configuración de conexión/backend.
+      - Configuración de rendimiento y alertas.
     """
 
     def __init__(self, logo_path: Optional[str] = None) -> None:
@@ -1015,6 +1276,17 @@ class MainWindow(QMainWindow):
 
         # Tema inicial
         self.current_theme = "dark"
+
+        # Configuración persistente
+        self.settings = QSettings("UAV-IASA", "GCS")
+
+        # Config de acentos (color principal)
+        self.accent_options = ACCENT_COLOR_OPTIONS
+        self.accent_choice_dark = self.settings.value("accent_dark", "Naranja")
+        self.accent_choice_light = self.settings.value("accent_light", "Naranja")
+        self._apply_accent_to_theme("dark", self.accent_choice_dark)
+        self._apply_accent_to_theme("light", self.accent_choice_light)
+
         self.setStyleSheet(build_stylesheet(self.current_theme))
         pg.setConfigOption("background", THEMES[self.current_theme]["graph_bg"])
         pg.setConfigOption("foreground", THEMES[self.current_theme]["text_main"])
@@ -1022,8 +1294,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("UAV-IASA UNAM — Ground Control")
         self.setMinimumSize(1280, 800)
 
-        # Configuración persistente
-        self.settings = QSettings("UAV-IASA", "GCS")
         if logo_path:
             self.logo_path = logo_path
         else:
@@ -1032,11 +1302,15 @@ class MainWindow(QMainWindow):
         self.save_dir = Path("datos_vuelo")
         self.save_dir.mkdir(exist_ok=True)
 
+        # Parámetros de rendimiento / BD (ajustables desde Configuración)
+        self.db_commit_per_sample = True       # escribir en disco por muestra
+        self.db_timer_interval_ms = 1000       # flush periódico (ms)
+
         # Base de datos local de historial
         self.db = HistorialDB(self.save_dir / "telemetria_ui.db")
         self.db_timer = QTimer(self)
         self.db_timer.timeout.connect(self.db.flush)
-        self.db_timer.start(1000)
+        self.db_timer.start(self.db_timer_interval_ms)
 
         self.last_export_path: Optional[str] = None
 
@@ -1044,6 +1318,13 @@ class MainWindow(QMainWindow):
         self.backend = None
         self.backend_task = None
         self.source_name = "DEMO"
+
+        # Reconexión automática
+        self.auto_reconnect_enabled = False
+        self.reconnect_interval_s = 5.0
+        self.reconnect_max_attempts = 3
+        self._last_endpoint: str = ""
+        self._reconnect_attempts = 0
 
         # Buffers para gráficas
         self.time_buf = deque(maxlen=600)
@@ -1054,6 +1335,37 @@ class MainWindow(QMainWindow):
         self.pres_buf = deque(maxlen=600)
         self.hum_buf = deque(maxlen=600)
 
+        # Habilitación individual de gráficas
+        self.graph_enabled = {
+            "alt": True,
+            "spd": True,
+            "vbat": True,
+            "tmp": True,
+            "pres": True,
+            "hum": True,
+        }
+        self.graph_toggle_buttons = {}
+
+        # Parámetros de rendimiento para cámara / gráficas / mapa
+        self.camera_update_ms = 120
+        self.graph_update_period_ms = 0        # 0 = actualizar cada muestra
+        self.map_update_period_ms = 0          # 0 = actualizar cada muestra
+        self.graph_max_points = 600
+        self.map_max_points = 1000
+
+        # Perfiles (6 niveles) para Configuración
+        self._cam_profile_intervals = [80, 100, 120, 150, 180, 220]
+        self._graph_profile_periods = [0, 0, 50, 100, 150, 200]
+        self._graph_profile_points = [0, 400, 600, 800, 1000, 1500]
+        self._map_profile_periods = [0, 0, 50, 100, 150, 200]
+        self._map_profile_points = [400, 600, 800, 1000, 1500, 2000]
+        self._db_profile_commit_flags = [True, True, False, False, False, False]
+        self._db_profile_intervals = [500, 1000, 1000, 1500, 2000, 3000]
+
+        # Buffer para mapa (lat/lon)
+        self.map_positions: deque[Tuple[float, float]] = deque(maxlen=self.map_max_points)
+        self.map_home: Optional[Tuple[float, float]] = None
+
         self.graph_paused = False
         self.graph_smooth = False
 
@@ -1061,7 +1373,47 @@ class MainWindow(QMainWindow):
         self.flight_time_s = 0.0
         self.last_time_s = None
 
+        # Energía específica (para tendencia)
+        self.prev_energy = None
+        self.energy_trend = 0
+
         self.last_sample: Optional[TelemetrySample] = None
+
+        # Timestamps para controlar frecuencia de refresco de mapa y gráficas
+        self._last_graph_update_ms = 0.0
+        self._last_map_update_ms = 0.0
+
+        # Alertas y seguridad (umbrales)
+        self.alert_batt_warn_pct = 30.0
+        self.alert_batt_crit_pct = 15.0
+        self.alert_alt_max = 120.0
+        self.alert_spd_max = 20.0
+        self.alert_temp_max = 70.0
+        self.alert_gps_min_sats = 5
+
+        self.alert_enable_batt = True
+        self.alert_enable_alt = True
+        self.alert_enable_spd = True
+        self.alert_enable_temp = True
+        self.alert_enable_gps = True
+        self.alert_enable_link = True
+
+        # Modo de alerta: "ui" = solo colores, "popup" = colores + QMessageBox
+        self.alert_style = "ui"
+
+        # Estado interno de alertas
+        self.last_batt_alert_level = 0   # 0=ok, 1=warn, 2=crit
+        self.alt_alert_active = False
+        self.spd_alert_active = False
+        self.temp_alert_active = False
+        self.gps_alert_active = False
+        self.link_alert_active = False
+
+        # Timeout de enlace (heartbeat)
+        self.link_timeout_s = 5.0
+        self.link_timeout_timer = QTimer(self)
+        self.link_timeout_timer.setSingleShot(True)
+        self.link_timeout_timer.timeout.connect(self._on_link_timeout)
 
         self.signals = TelemetrySignals()
         self.signals.sample.connect(self._handle_sample)
@@ -1073,16 +1425,36 @@ class MainWindow(QMainWindow):
         self._is_connecting = False
         self._connecting_fake_level = 0
 
+        # Animación de pulse de barras al conectar OK
+        self.signal_pulse_timer = QTimer(self)
+        self.signal_pulse_timer.timeout.connect(self._signal_pulse_step)
+        self._signal_pulse_target = 4
+        self._signal_pulse_level = 0
+
         # Construcción de UI
         self._build_ui()
         self._setup_button_animations()
 
-        # Cámara simulada (se actualiza aunque sea DEMO)
+        # Cámara simulada (se actualiza según perfil de rendimiento)
         self.cam_timer = QTimer(self)
         self.cam_timer.timeout.connect(self._tick_camera)
-        self.cam_timer.start(120)
+        self.cam_timer.start(self.camera_update_ms)
+
+        # Inicializar controles de rendimiento (perfiles) con valores intermedios
+        self._init_performance_controls()
 
         self.statusBar().hide()
+
+    # ------------------------------------------------------------------
+    # APLICAR ACENTOS
+    # ------------------------------------------------------------------
+
+    def _apply_accent_to_theme(self, theme_name: str, color_name: str):
+        palette = self.accent_options.get(color_name)
+        if not palette:
+            return
+        THEMES[theme_name]["accent_color"] = palette[0]
+        THEMES[theme_name]["accent_soft"] = palette[1]
 
     # ------------------------------------------------------------------
     # CONSTRUCCIÓN DE INTERFAZ
@@ -1124,6 +1496,7 @@ class MainWindow(QMainWindow):
 
         # Botones de navegación
         self.btn_dash = self._nav_button("Dashboard")
+        self.btn_map = self._nav_button("Mapa")
         self.btn_graph = self._nav_button("Gráficas")
         self.btn_hist = self._nav_button("Historial")
         self.btn_conn = self._nav_button("Conexión")
@@ -1131,16 +1504,30 @@ class MainWindow(QMainWindow):
         self.btn_dash.setChecked(True)
 
         sbl.addWidget(self.btn_dash)
+        sbl.addWidget(self.btn_map)
         sbl.addWidget(self.btn_graph)
         sbl.addWidget(self.btn_hist)
         sbl.addWidget(self.btn_conn)
         sbl.addStretch()
 
-        # Botón de cambio de tema (oscuro/claro)
+        # Botones inferiores: engrane pequeño + cambio de tema
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(8)
+
+        # ÚNICO botón de engrane (emoji ⚙️) junto al cambio de tema
+        self.btn_open_settings_small = QPushButton("⚙️")
+        self.btn_open_settings_small.setProperty("action", "secondary")
+        self.btn_open_settings_small.setFixedWidth(36)
+        self.btn_open_settings_small.clicked.connect(lambda: self._set_page(5))
+
         self.btn_theme = QPushButton("Modo claro")
         self.btn_theme.setObjectName("ThemeToggleButton")
         self.btn_theme.clicked.connect(self._toggle_theme)
-        sbl.addWidget(self.btn_theme)
+
+        bottom_row.addWidget(self.btn_open_settings_small)
+        bottom_row.addWidget(self.btn_theme, 1)
+
+        sbl.addLayout(bottom_row)
 
         layout.addWidget(sidebar)
 
@@ -1149,20 +1536,25 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.stack, 1)
 
         self.page_dashboard = self._build_page_dashboard()
+        self.page_map = self._build_page_map()
         self.page_graphs = self._build_page_graphs()
         self.page_history = self._build_page_history()
         self.page_connection = self._build_page_connection()
+        self.page_settings = self._build_page_settings()
 
-        self.stack.addWidget(self.page_dashboard)
-        self.stack.addWidget(self.page_graphs)
-        self.stack.addWidget(self.page_history)
-        self.stack.addWidget(self.page_connection)
+        self.stack.addWidget(self.page_dashboard)   # 0
+        self.stack.addWidget(self.page_map)         # 1
+        self.stack.addWidget(self.page_graphs)      # 2
+        self.stack.addWidget(self.page_history)     # 3
+        self.stack.addWidget(self.page_connection)  # 4
+        self.stack.addWidget(self.page_settings)    # 5
 
         # Conectar navegación
         self.btn_dash.clicked.connect(lambda: self._set_page(0))
-        self.btn_graph.clicked.connect(lambda: self._set_page(1))
-        self.btn_hist.clicked.connect(lambda: self._set_page(2))
-        self.btn_conn.clicked.connect(lambda: self._set_page(3))
+        self.btn_map.clicked.connect(lambda: self._set_page(1))
+        self.btn_graph.clicked.connect(lambda: self._set_page(2))
+        self.btn_hist.clicked.connect(lambda: self._set_page(3))
+        self.btn_conn.clicked.connect(lambda: self._set_page(4))
 
     def _nav_button(self, text: str) -> QPushButton:
         """Crea un botón de navegación lateral."""
@@ -1174,12 +1566,29 @@ class MainWindow(QMainWindow):
     def _set_page(self, idx: int):
         """Cambia la página visible en el stack."""
         self.stack.setCurrentIndex(idx)
-        btns = [self.btn_dash, self.btn_graph, self.btn_hist, self.btn_conn]
+        btns = [
+            self.btn_dash,
+            self.btn_map,
+            self.btn_graph,
+            self.btn_hist,
+            self.btn_conn,
+        ]
         for i, b in enumerate(btns):
             b.setChecked(i == idx)
-        if idx == 2:
+
+        if idx == 3:
             # Al entrar al historial, recargar tabla
             self._reload_history_table()
+        elif idx == 2:
+            # Al entrar a gráficas, refrescar una vez con todos los datos acumulados
+            self._update_graphs()
+        elif idx == 1 and self.last_sample is not None:
+            # Al entrar al mapa, refrescar una vez con la última muestra
+            lat = getattr(self.last_sample, "lat_deg", 0.0) or 0.0
+            lon = getattr(self.last_sample, "lon_deg", 0.0) or 0.0
+            alt = getattr(self.last_sample, "rel_alt_m", 0.0) or 0.0
+            spd = getattr(self.last_sample, "groundspeed_ms", 0.0) or 0.0
+            self._update_map(lat, lon, alt, spd)
 
     # ------------------------------------------------------------------
     # PÁGINA: DASHBOARD DE VUELO
@@ -1223,19 +1632,18 @@ class MainWindow(QMainWindow):
         sc.setSpacing(4)
 
         self.lbl_status_line1 = QLabel("GPS: -- sats | Modo: -- | En aire: -- | Fuente: --")
-        # Hacemos la línea 1 un poco más grande
         accent = THEMES[self.current_theme]["accent_color"]
         self.lbl_status_line1.setStyleSheet(
             f"font-size: 12px; color: {THEMES[self.current_theme]['text_main']};"
         )
 
+        # CONTRATO DE DATOS EN FORMATO EXACTO: temp:23.7,hum:45.2,...
         self.lbl_status_line2 = QLabel(
-            f"<span style='color:{accent}; font-weight:600;'>Contrato:</span> "
-            "temp:--,hum:--,pres:--,rad:--,lat:--,lon:--,speed:--,acc:--,ts:--"
+            "temp:--,hum:--,pres:--,lat:--,lon:--,speed:--,acc:--"
         )
-        self.lbl_status_line2.setTextFormat(Qt.RichText)
+        self.lbl_status_line2.setTextFormat(Qt.PlainText)
         self.lbl_status_line2.setStyleSheet(
-            f"font-size: 12px; color: {THEMES[self.current_theme]['text_main']};"
+            f"font-size: 12px; color: {accent};"
         )
 
         sc.addWidget(self.lbl_status_line1)
@@ -1398,6 +1806,97 @@ class MainWindow(QMainWindow):
         return page
 
     # ------------------------------------------------------------------
+    # PÁGINA: MAPA / NAVEGACIÓN
+    # ------------------------------------------------------------------
+
+    def _build_page_map(self) -> QWidget:
+        """
+        Página de mapa / navegación:
+        - Traza la trayectoria en coordenadas lat/lon.
+        - Muestra posición actual y punto "home".
+        - Auto-zoom y crosshair interactivo.
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        title = QLabel("Mapa / Navegación")
+        title.setProperty("role", "title")
+        header.addWidget(title)
+        header.addStretch()
+
+        self.lbl_map_status = QLabel("Lat: --  Lon: --  Alt: -- m  Vel: -- m/s")
+        self.lbl_map_status.setProperty("role", "unit")
+        header.addWidget(self.lbl_map_status)
+
+        layout.addLayout(header)
+
+        card = QFrame()
+        card.setProperty("card", True)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(12, 12, 12, 12)
+        cl.setSpacing(8)
+
+        lbl_sub = QLabel("Trayectoria (vista top-down)")
+        lbl_sub.setProperty("role", "subtitle")
+        cl.addWidget(lbl_sub)
+
+        self.map_plot = pg.PlotWidget()
+        self.map_plot.showGrid(x=True, y=True, alpha=0.15)
+        self.map_plot.setBackground(THEMES[self.current_theme]["graph_bg"])
+        self.map_plot.setAspectLocked(True)
+        self.map_plot.setLabel("left", "Latitud [deg]")
+        self.map_plot.setLabel("bottom", "Longitud [deg]")
+        self.map_plot.setMouseEnabled(x=True, y=True)
+        self.map_plot.enableAutoRange(x=True, y=True)
+
+        # Curva de trayectoria
+        self.map_curve = self.map_plot.plot(
+            pen=pg.mkPen(THEMES[self.current_theme]["accent_color"], width=2)
+        )
+        # Punto UAV actual
+        self.map_uav_spot = pg.ScatterPlotItem(
+            size=10,
+            pen=pg.mkPen("w", width=1),
+            brush=pg.mkBrush(THEMES[self.current_theme]["accent_color"]),
+            symbol="o",
+        )
+        self.map_plot.addItem(self.map_uav_spot)
+
+        # Punto home
+        self.map_home_spot = pg.ScatterPlotItem(
+            size=12,
+            pen=pg.mkPen("#FFD60A", width=1.5),
+            brush=pg.mkBrush(0, 0, 0, 0),
+            symbol="+",
+        )
+        self.map_plot.addItem(self.map_home_spot)
+
+        # Crosshair
+        self.map_crosshair_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#444", width=1))
+        self.map_crosshair_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#444", width=1))
+        self.map_plot.addItem(self.map_crosshair_v, ignoreBounds=True)
+        self.map_plot.addItem(self.map_crosshair_h, ignoreBounds=True)
+
+        self.map_plot.scene().sigMouseMoved.connect(self._on_map_mouse_moved)
+
+        cl.addWidget(self.map_plot)
+        layout.addWidget(card, 1)
+
+        return page
+
+    def _on_map_mouse_moved(self, pos):
+        """Actualiza el crosshair cuando se mueve el mouse sobre el mapa."""
+        if self.map_plot.sceneBoundingRect().contains(pos):
+            mouse_point = self.map_plot.plotItem.vb.mapSceneToView(pos)
+            x = mouse_point.x()
+            y = mouse_point.y()
+            self.map_crosshair_v.setPos(x)
+            self.map_crosshair_h.setPos(y)
+
+    # ------------------------------------------------------------------
     # PÁGINA: GRÁFICAS DE TELEMETRÍA
     # ------------------------------------------------------------------
 
@@ -1406,6 +1905,7 @@ class MainWindow(QMainWindow):
         Construye la página de gráficas:
         - Cada métrica tiene su propia gráfica y color.
         - Botones para pausar y suavizar la señal.
+        - Botón de habilitar/deshabilitar gráfica (punto verde/rojo).
         """
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1437,7 +1937,7 @@ class MainWindow(QMainWindow):
 
         # Colores por métrica
         self.metric_colors = {
-            "alt": "#FF8A00",   # naranja
+            "alt": THEMES[self.current_theme]["accent_color"],   # se actualiza con el tema
             "spd": "#00D1FF",   # cyan
             "vbat": "#30D158",  # verde
             "tmp": "#FF375F",   # rojo rosado
@@ -1451,6 +1951,7 @@ class MainWindow(QMainWindow):
               - título
               - valor actual
               - botón “Detalle”
+              - botón de habilitar/deshabilitar gráfica (punto verde/rojo)
               - gráfica pyqtgraph
             """
             card = QFrame()
@@ -1467,17 +1968,46 @@ class MainWindow(QMainWindow):
             header_plot.addWidget(lbl_icon)
             header_plot.addWidget(lbl_title)
             header_plot.addStretch()
-            value_lbl = QLabel("--")
-            value_lbl.setProperty("role", "metricSmall")
+
+            # Botón para activar/desactivar esta gráfica
+            toggle_btn = QPushButton("●")
+            toggle_btn.setCheckable(True)
+            toggle_btn.setFlat(True)
+            toggle_btn.setFixedWidth(24)
+            toggle_btn.setChecked(self.graph_enabled.get(key, True))
+
+            def _update_toggle_style():
+                checked = toggle_btn.isChecked()
+                color = (
+                    THEMES[self.current_theme]["success_color"]
+                    if checked
+                    else THEMES[self.current_theme]["danger_color"]
+                )
+                toggle_btn.setStyleSheet(
+                    f"color:{color}; background:transparent; border:none; font-size:16px;"
+                )
+
+            def _on_toggle(checked: bool, k=key):
+                self.graph_enabled[k] = checked
+                _update_toggle_style()
+
+            toggle_btn.toggled.connect(_on_toggle)
+            self.graph_toggle_buttons[key] = toggle_btn
+            _update_toggle_style()
 
             btn_expand = QPushButton("Detalle")
             btn_expand.setProperty("action", "secondary")
+
+            value_lbl = QLabel("--")
+            value_lbl.setProperty("role", "metricSmall")
+
             btn_expand.clicked.connect(
                 lambda _, col=db_column, u=unit, ttl=title_text, k=key: self._open_metric_detail(
                     ttl, col, u, self.metric_colors[k]
                 )
             )
 
+            header_plot.addWidget(toggle_btn)
             header_plot.addWidget(btn_expand)
             header_plot.addWidget(value_lbl)
             cl.addLayout(header_plot)
@@ -1673,6 +2203,7 @@ class MainWindow(QMainWindow):
         Construye la página de conexión:
         - Selección de fuente (DEMO / MAVSDK / LoRa).
         - Endpoint o puerto serie.
+        - Config avanzada por backend.
         - Indicador de intensidad de enlace.
         """
         page = QWidget()
@@ -1694,6 +2225,8 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         self.combo_source = QComboBox()
         self.combo_source.addItems(["DEMO", "MAVSDK", "LoRa"])
+        self.combo_source.currentTextChanged.connect(self._on_source_changed)
+
         self.edit_endpoint = QLineEdit("udp://:14540")
         form.addRow("Fuente:", self.combo_source)
         form.addRow("Endpoint / Puerto:", self.edit_endpoint)
@@ -1707,6 +2240,43 @@ class MainWindow(QMainWindow):
         info.setProperty("role", "unit")
         cl.addWidget(info)
 
+        # Configuración avanzada MAVSDK
+        self.mavsdk_adv_frame = QFrame()
+        mav_form = QFormLayout(self.mavsdk_adv_frame)
+        self.spin_mav_system_id = QSpinBox()
+        self.spin_mav_system_id.setRange(1, 255)
+        self.spin_mav_system_id.setValue(1)
+        self.spin_mav_comp_id = QSpinBox()
+        self.spin_mav_comp_id.setRange(1, 255)
+        self.spin_mav_comp_id.setValue(1)
+        self.spin_mav_timeout = QDoubleSpinBox()
+        self.spin_mav_timeout.setRange(0.5, 60.0)
+        self.spin_mav_timeout.setDecimals(1)
+        self.spin_mav_timeout.setValue(10.0)
+        mav_form.addRow("MAVSDK system_id:", self.spin_mav_system_id)
+        mav_form.addRow("MAVSDK component_id:", self.spin_mav_comp_id)
+        mav_form.addRow("Timeout conexión SITL (s):", self.spin_mav_timeout)
+        cl.addWidget(self.mavsdk_adv_frame)
+
+        # Configuración avanzada LoRa
+        self.lora_adv_frame = QFrame()
+        lora_form = QFormLayout(self.lora_adv_frame)
+        self.combo_lora_baud = QComboBox()
+        self.combo_lora_baud.addItems(["57600", "115200", "38400", "19200"])
+        self.combo_lora_baud.setCurrentText("57600")
+        self.spin_lora_buffer = QSpinBox()
+        self.spin_lora_buffer.setRange(32, 4096)
+        self.spin_lora_buffer.setValue(256)
+        self.spin_lora_retry_delay = QDoubleSpinBox()
+        self.spin_lora_retry_delay.setRange(0.1, 10.0)
+        self.spin_lora_retry_delay.setDecimals(1)
+        self.spin_lora_retry_delay.setValue(1.0)
+        lora_form.addRow("LoRa baudrate:", self.combo_lora_baud)
+        lora_form.addRow("Tamaño buffer paquete:", self.spin_lora_buffer)
+        lora_form.addRow("Retraso reintento (s):", self.spin_lora_retry_delay)
+        cl.addWidget(self.lora_adv_frame)
+
+        # Botón conectar
         btn_connect = QPushButton("Conectar")
         btn_connect.setProperty("action", "primary")
         btn_connect.clicked.connect(self._on_connect_clicked)
@@ -1722,7 +2292,442 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(card, 0)
 
+        # Ajustar visibilidad inicial
+        self._on_source_changed(self.combo_source.currentText())
+
         return page
+
+    def _on_source_changed(self, text: str):
+        """Muestra/oculta configuración avanzada según backend."""
+        if text == "MAVSDK":
+            self.mavsdk_adv_frame.show()
+            self.lora_adv_frame.hide()
+        elif text == "LoRa":
+            self.mavsdk_adv_frame.hide()
+            self.lora_adv_frame.show()
+        else:
+            self.mavsdk_adv_frame.hide()
+            self.lora_adv_frame.hide()
+
+    # ------------------------------------------------------------------
+    # PÁGINA: CONFIGURACIÓN (RENDIMIENTO, ALERTAS, COLOR PRINCIPAL)
+    # ------------------------------------------------------------------
+
+    def _build_page_settings(self) -> QWidget:
+        """
+        Página de configuración:
+        - Color principal (accent) para modo oscuro y claro.
+        - Cámara / HUD.
+        - Gráficas.
+        - Mapa.
+        - BD / disco.
+        - Alertas y seguridad.
+        - Reconexión automática.
+        - Timeout de enlace.
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        title = QLabel("Configuración")
+        title.setProperty("role", "title")
+        header.addWidget(title)
+        header.addStretch()
+        layout.addLayout(header)
+
+        card = QFrame()
+        card.setProperty("card", True)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(24, 20, 24, 20)
+        cl.setSpacing(18)
+
+        # --- Color principal (accent) --------------------------------
+        lbl_accent = QLabel("Color principal (accent)")
+        lbl_accent.setProperty("role", "subtitle")
+        cl.addWidget(lbl_accent)
+
+        row_accent_dark = QHBoxLayout()
+        lbl_dark = QLabel("Modo oscuro:")
+        lbl_dark.setProperty("role", "unit")
+        row_accent_dark.addWidget(lbl_dark)
+        row_accent_dark.addStretch()
+        self.combo_accent_dark = QComboBox()
+        self.combo_accent_dark.addItems(list(self.accent_options.keys()))
+        idx_dark = self.combo_accent_dark.findText(self.accent_choice_dark)
+        if idx_dark >= 0:
+            self.combo_accent_dark.setCurrentIndex(idx_dark)
+        self.combo_accent_dark.currentTextChanged.connect(self._on_accent_dark_changed)
+        row_accent_dark.addWidget(self.combo_accent_dark)
+        cl.addLayout(row_accent_dark)
+
+        row_accent_light = QHBoxLayout()
+        lbl_light = QLabel("Modo claro:")
+        lbl_light.setProperty("role", "unit")
+        row_accent_light.addWidget(lbl_light)
+        row_accent_light.addStretch()
+        self.combo_accent_light = QComboBox()
+        self.combo_accent_light.addItems(list(self.accent_options.keys()))
+        idx_light = self.combo_accent_light.findText(self.accent_choice_light)
+        if idx_light >= 0:
+            self.combo_accent_light.setCurrentIndex(idx_light)
+        self.combo_accent_light.currentTextChanged.connect(self._on_accent_light_changed)
+        row_accent_light.addWidget(self.combo_accent_light)
+        cl.addLayout(row_accent_light)
+
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.HLine)
+        cl.addWidget(sep1)
+
+        # Cámara / HUD
+        row_cam = QHBoxLayout()
+        lbl_cam = QLabel("Cámara y HUD (frecuencia de actualización):")
+        lbl_cam.setProperty("role", "unit")
+        row_cam.addWidget(lbl_cam)
+        row_cam.addStretch()
+        self.combo_cam_profile = QComboBox()
+        self.combo_cam_profile.addItems([
+            "Nivel 1 – Muy ligero",
+            "Nivel 2 – Ligero",
+            "Nivel 3 – Medio",
+            "Nivel 4 – Alto",
+            "Nivel 5 – Muy alto",
+            "Nivel 6 – Extremo (más carga)",
+        ])
+        self.combo_cam_profile.currentIndexChanged.connect(self._on_cam_profile_changed)
+        row_cam.addWidget(self.combo_cam_profile)
+        cl.addLayout(row_cam)
+
+        # Gráficas
+        row_graph = QHBoxLayout()
+        lbl_graph = QLabel("Gráficas (downsampling y refresco):")
+        lbl_graph.setProperty("role", "unit")
+        row_graph.addWidget(lbl_graph)
+        row_graph.addStretch()
+        self.combo_graph_profile = QComboBox()
+        self.combo_graph_profile.addItems([
+            "Nivel 1 – Máxima precisión (sin downsampling)",
+            "Nivel 2 – Alta precisión",
+            "Nivel 3 – Equilibrado",
+            "Nivel 4 – Rendimiento medio",
+            "Nivel 5 – Rendimiento alto",
+            "Nivel 6 – Modo extremo (pocos puntos)",
+        ])
+        self.combo_graph_profile.currentIndexChanged.connect(self._on_graph_profile_changed)
+        row_graph.addWidget(self.combo_graph_profile)
+        cl.addLayout(row_graph)
+
+        # Mapa
+        row_map = QHBoxLayout()
+        lbl_map = QLabel("Mapa (puntos en trayectoria y refresco):")
+        lbl_map.setProperty("role", "unit")
+        row_map.addWidget(lbl_map)
+        row_map.addStretch()
+        self.combo_map_profile = QComboBox()
+        self.combo_map_profile.addItems([
+            "Nivel 1 – Trayectoria corta",
+            "Nivel 2 – 400–600 puntos",
+            "Nivel 3 – 800 puntos",
+            "Nivel 4 – 1000 puntos (recomendado)",
+            "Nivel 5 – 1500 puntos",
+            "Nivel 6 – 2000 puntos (máximo)",
+        ])
+        self.combo_map_profile.currentIndexChanged.connect(self._on_map_profile_changed)
+        row_map.addWidget(self.combo_map_profile)
+        cl.addLayout(row_map)
+
+        # BD / disco
+        row_db = QHBoxLayout()
+        lbl_db = QLabel("Escritura a disco (frecuencia de commits):")
+        lbl_db.setProperty("role", "unit")
+        row_db.addWidget(lbl_db)
+        row_db.addStretch()
+        self.combo_db_profile = QComboBox()
+        self.combo_db_profile.addItems([
+            "Nivel 1 – Máxima precisión (por muestra + flush rápido)",
+            "Nivel 2 – Alta precisión (por muestra + flush estándar)",
+            "Nivel 3 – Equilibrado (solo flush rápido)",
+            "Nivel 4 – Ahorro (solo flush estándar)",
+            "Nivel 5 – Ahorro alto (flush más espaciado)",
+            "Nivel 6 – Modo extremo (mínimo acceso a disco)",
+        ])
+        self.combo_db_profile.currentIndexChanged.connect(self._on_db_profile_changed)
+        row_db.addWidget(self.combo_db_profile)
+        cl.addLayout(row_db)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        cl.addWidget(sep2)
+
+        # Alertas y seguridad
+        lbl_alerts = QLabel("Alertas y seguridad")
+        lbl_alerts.setProperty("role", "subtitle")
+        cl.addWidget(lbl_alerts)
+
+        alerts_form = QFormLayout()
+        self.spin_batt_warn = QSpinBox()
+        self.spin_batt_warn.setRange(0, 100)
+        self.spin_batt_warn.setValue(int(self.alert_batt_warn_pct))
+        self.spin_batt_warn.valueChanged.connect(
+            lambda v: setattr(self, "alert_batt_warn_pct", float(v))
+        )
+
+        self.spin_batt_crit = QSpinBox()
+        self.spin_batt_crit.setRange(0, 100)
+        self.spin_batt_crit.setValue(int(self.alert_batt_crit_pct))
+        self.spin_batt_crit.valueChanged.connect(
+            lambda v: setattr(self, "alert_batt_crit_pct", float(v))
+        )
+
+        self.spin_alt_max = QDoubleSpinBox()
+        self.spin_alt_max.setRange(0.0, 10000.0)
+        self.spin_alt_max.setDecimals(1)
+        self.spin_alt_max.setValue(self.alert_alt_max)
+        self.spin_alt_max.valueChanged.connect(
+            lambda v: setattr(self, "alert_alt_max", float(v))
+        )
+
+        self.spin_spd_max = QDoubleSpinBox()
+        self.spin_spd_max.setRange(0.0, 200.0)
+        self.spin_spd_max.setDecimals(1)
+        self.spin_spd_max.setValue(self.alert_spd_max)
+        self.spin_spd_max.valueChanged.connect(
+            lambda v: setattr(self, "alert_spd_max", float(v))
+        )
+
+        self.spin_temp_max = QDoubleSpinBox()
+        self.spin_temp_max.setRange(-40.0, 150.0)
+        self.spin_temp_max.setDecimals(1)
+        self.spin_temp_max.setValue(self.alert_temp_max)
+        self.spin_temp_max.valueChanged.connect(
+            lambda v: setattr(self, "alert_temp_max", float(v))
+        )
+
+        self.spin_gps_min_sats = QSpinBox()
+        self.spin_gps_min_sats.setRange(0, 30)
+        self.spin_gps_min_sats.setValue(self.alert_gps_min_sats)
+        self.spin_gps_min_sats.valueChanged.connect(
+            lambda v: setattr(self, "alert_gps_min_sats", int(v))
+        )
+
+        self.spin_link_timeout = QDoubleSpinBox()
+        self.spin_link_timeout.setRange(0.0, 60.0)
+        self.spin_link_timeout.setDecimals(1)
+        self.spin_link_timeout.setValue(self.link_timeout_s)
+        self.spin_link_timeout.valueChanged.connect(self._on_link_timeout_changed)
+
+        alerts_form.addRow("Batería baja 1 (warning %) :", self.spin_batt_warn)
+        alerts_form.addRow("Batería baja 2 (crítico %) :", self.spin_batt_crit)
+        alerts_form.addRow("Altitud máx recomendada (m):", self.spin_alt_max)
+        alerts_form.addRow("Velocidad máx recomendada (m/s):", self.spin_spd_max)
+        alerts_form.addRow("Temperatura máx (°C):", self.spin_temp_max)
+        alerts_form.addRow("GPS sats mínimos:", self.spin_gps_min_sats)
+        alerts_form.addRow("Timeout enlace (s, 0=desact.):", self.spin_link_timeout)
+        cl.addLayout(alerts_form)
+
+        # Selección de eventos
+        row_events = QHBoxLayout()
+        row_events.addWidget(QLabel("Eventos activos:"))
+        self.chk_alert_batt = QCheckBox("Batería baja")
+        self.chk_alert_batt.setChecked(self.alert_enable_batt)
+        self.chk_alert_batt.toggled.connect(
+            lambda v: setattr(self, "alert_enable_batt", bool(v))
+        )
+        self.chk_alert_alt = QCheckBox("Altitud alta")
+        self.chk_alert_alt.setChecked(self.alert_enable_alt)
+        self.chk_alert_alt.toggled.connect(
+            lambda v: setattr(self, "alert_enable_alt", bool(v))
+        )
+        self.chk_alert_spd = QCheckBox("Velocidad alta")
+        self.chk_alert_spd.setChecked(self.alert_enable_spd)
+        self.chk_alert_spd.toggled.connect(
+            lambda v: setattr(self, "alert_enable_spd", bool(v))
+        )
+        self.chk_alert_temp = QCheckBox("Temperatura alta")
+        self.chk_alert_temp.setChecked(self.alert_enable_temp)
+        self.chk_alert_temp.toggled.connect(
+            lambda v: setattr(self, "alert_enable_temp", bool(v))
+        )
+        self.chk_alert_gps = QCheckBox("GPS bajo")
+        self.chk_alert_gps.setChecked(self.alert_enable_gps)
+        self.chk_alert_gps.toggled.connect(
+            lambda v: setattr(self, "alert_enable_gps", bool(v))
+        )
+        self.chk_alert_link = QCheckBox("Pérdida de enlace")
+        self.chk_alert_link.setChecked(self.alert_enable_link)
+        self.chk_alert_link.toggled.connect(
+            lambda v: setattr(self, "alert_enable_link", bool(v))
+        )
+        row_events.addWidget(self.chk_alert_batt)
+        row_events.addWidget(self.chk_alert_alt)
+        row_events.addWidget(self.chk_alert_spd)
+        row_events.addWidget(self.chk_alert_temp)
+        row_events.addWidget(self.chk_alert_gps)
+        row_events.addWidget(self.chk_alert_link)
+        row_events.addStretch()
+        cl.addLayout(row_events)
+
+        # Estilo de alerta
+        row_style = QHBoxLayout()
+        lbl_style = QLabel("Estilo de alerta:")
+        lbl_style.setProperty("role", "unit")
+        row_style.addWidget(lbl_style)
+        row_style.addStretch()
+        self.combo_alert_style = QComboBox()
+        self.combo_alert_style.addItems(
+            ["Solo color en la interfaz", "Color + ventana emergente"]
+        )
+        self.combo_alert_style.setCurrentIndex(
+            0 if self.alert_style == "ui" else 1
+        )
+        self.combo_alert_style.currentIndexChanged.connect(self._on_alert_style_changed)
+        row_style.addWidget(self.combo_alert_style)
+        cl.addLayout(row_style)
+
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.HLine)
+        cl.addWidget(sep3)
+
+        # Reconexión automática
+        lbl_reconn = QLabel("Reconexión automática (backend / redes)")
+        lbl_reconn.setProperty("role", "subtitle")
+        cl.addWidget(lbl_reconn)
+
+        row_auto_reconn = QHBoxLayout()
+        self.chk_auto_reconnect = QCheckBox("Habilitar reconexión automática")
+        self.chk_auto_reconnect.setChecked(self.auto_reconnect_enabled)
+        self.chk_auto_reconnect.toggled.connect(
+            lambda v: setattr(self, "auto_reconnect_enabled", bool(v))
+        )
+        row_auto_reconn.addWidget(self.chk_auto_reconnect)
+        row_auto_reconn.addStretch()
+        cl.addLayout(row_auto_reconn)
+
+        reconn_form = QFormLayout()
+        self.spin_reconnect_interval = QDoubleSpinBox()
+        self.spin_reconnect_interval.setRange(1.0, 120.0)
+        self.spin_reconnect_interval.setDecimals(1)
+        self.spin_reconnect_interval.setValue(self.reconnect_interval_s)
+        self.spin_reconnect_interval.valueChanged.connect(
+            lambda v: setattr(self, "reconnect_interval_s", float(v))
+        )
+
+        self.spin_reconnect_max = QSpinBox()
+        self.spin_reconnect_max.setRange(0, 100)
+        self.spin_reconnect_max.setValue(self.reconnect_max_attempts)
+        self.spin_reconnect_max.valueChanged.connect(
+            lambda v: setattr(self, "reconnect_max_attempts", int(v))
+        )
+
+        reconn_form.addRow("Reintentar cada (s):", self.spin_reconnect_interval)
+        reconn_form.addRow("Máx reintentos (0 = infinito):", self.spin_reconnect_max)
+        cl.addLayout(reconn_form)
+
+        info_txt = QLabel(
+            "Nota:\n"
+            "- Mapa y gráficas solo se redibujan cuando su pestaña está visible.\n"
+            "- La cámara solo se anima en el Dashboard.\n"
+            "- Puedes combinar niveles para buscar el mejor compromiso entre lag y precisión."
+        )
+        info_txt.setProperty("role", "unit")
+        cl.addWidget(info_txt)
+
+        layout.addWidget(card)
+
+        return page
+
+    # ------------------------------------------------------------------
+    # MANEJO DE PERFILES DE RENDIMIENTO
+    # ------------------------------------------------------------------
+
+    def _init_performance_controls(self):
+        """
+        Inicializa los combos de rendimiento con valores intermedios sin
+        comprometer nada. Se llama después de crear timers.
+        """
+        # Cámara: nivel 3 (índice 2)
+        if hasattr(self, "combo_cam_profile"):
+            self.combo_cam_profile.blockSignals(True)
+            self.combo_cam_profile.setCurrentIndex(2)
+            self.combo_cam_profile.blockSignals(False)
+            self._on_cam_profile_changed(2)
+
+        # Gráficas: nivel 3 (equilibrado)
+        if hasattr(self, "combo_graph_profile"):
+            self.combo_graph_profile.blockSignals(True)
+            self.combo_graph_profile.setCurrentIndex(2)
+            self.combo_graph_profile.blockSignals(False)
+            self._on_graph_profile_changed(2)
+
+        # Mapa: nivel 4 (1000 puntos aprox)
+        if hasattr(self, "combo_map_profile"):
+            self.combo_map_profile.blockSignals(True)
+            self.combo_map_profile.setCurrentIndex(3)
+            self.combo_map_profile.blockSignals(False)
+            self._on_map_profile_changed(3)
+
+        # BD: nivel 2 (alta precisión)
+        if hasattr(self, "combo_db_profile"):
+            self.combo_db_profile.blockSignals(True)
+            self.combo_db_profile.setCurrentIndex(1)
+            self.combo_db_profile.blockSignals(False)
+            self._on_db_profile_changed(1)
+
+    def _on_cam_profile_changed(self, idx: int):
+        """Cambia el periodo de actualización de la cámara según el nivel."""
+        if not hasattr(self, "_cam_profile_intervals"):
+            return
+        idx = max(0, min(5, idx))
+        self.camera_update_ms = self._cam_profile_intervals[idx]
+        if hasattr(self, "cam_timer"):
+            self.cam_timer.setInterval(self.camera_update_ms)
+
+    def _on_graph_profile_changed(self, idx: int):
+        """Ajusta frecuencia y downsampling de gráficas."""
+        if not hasattr(self, "_graph_profile_periods"):
+            return
+        idx = max(0, min(5, idx))
+        self.graph_update_period_ms = self._graph_profile_periods[idx]
+        self.graph_max_points = self._graph_profile_points[idx]
+
+    def _on_map_profile_changed(self, idx: int):
+        """Ajusta frecuencia de refresco y nº máximo de puntos en el mapa."""
+        if not hasattr(self, "_map_profile_periods"):
+            return
+        idx = max(0, min(5, idx))
+        self.map_update_period_ms = self._map_profile_periods[idx]
+        new_max = self._map_profile_points[idx]
+        self._set_map_max_points(new_max)
+
+    def _on_db_profile_changed(self, idx: int):
+        """Cambia cómo y cada cuánto se hace flush de la BD."""
+        if not hasattr(self, "_db_profile_commit_flags"):
+            return
+        idx = max(0, min(5, idx))
+        self.db_commit_per_sample = self._db_profile_commit_flags[idx]
+        self.db_timer_interval_ms = self._db_profile_intervals[idx]
+        if hasattr(self, "db_timer"):
+            self.db_timer.setInterval(self.db_timer_interval_ms)
+
+    # ------------------------------------------------------------------
+    # ANIMACIONES DE SEÑAL / CONEXIÓN
+    # ------------------------------------------------------------------
+
+    def _start_signal_pulse(self, target_level: int = 4):
+        """Inicia una animación rápida de subida de barras de señal."""
+        self._signal_pulse_target = max(0, min(4, target_level))
+        self._signal_pulse_level = 0
+        self.signal_pulse_timer.start(80)
+
+    def _signal_pulse_step(self):
+        """Paso de la animación de barras de señal."""
+        self._signal_pulse_level += 1
+        lvl = min(self._signal_pulse_level, self._signal_pulse_target)
+        self.signal_widget.set_level(lvl)
+        self.signal_widget_conn.set_level(lvl)
+        if self._signal_pulse_level >= self._signal_pulse_target:
+            self.signal_pulse_timer.stop()
 
     def _set_connection_status(self, connected: bool, extra: str = ""):
         """Actualiza el texto de estado de conexión en el header del dashboard."""
@@ -1733,6 +2738,7 @@ class MainWindow(QMainWindow):
             self.lbl_conn_status.setStyleSheet(
                 f"color:{t['success_color']}; font-weight:600;"
             )
+            self._start_signal_pulse(4)
         else:
             self._stop_connecting_animation()
             self.lbl_conn_status.setText("Desconectado")
@@ -1763,7 +2769,6 @@ class MainWindow(QMainWindow):
         self.lbl_conn_status.setStyleSheet(
             f"color:{t['accent_color']}; font-weight:600;"
         )
-        # Barras de señal simuladas
         self._connecting_fake_level = (self._connecting_fake_level + 1) % 5
         self.signal_widget.set_level(self._connecting_fake_level)
         self.signal_widget_conn.set_level(self._connecting_fake_level)
@@ -1773,13 +2778,14 @@ class MainWindow(QMainWindow):
         src = self.combo_source.currentText()
         self.source_name = src
         endpoint = self.edit_endpoint.text().strip()
+        self._last_endpoint = endpoint
+        self._reconnect_attempts = 0
 
         # Detener backend previo si existe
         if self.backend is not None and hasattr(self.backend, "stop"):
             try:
                 asyncio.create_task(self.backend.stop())
             except RuntimeError:
-                # Si no hay loop de asyncio activo, se ignora.
                 pass
 
         # Crear backend según la fuente seleccionada
@@ -1787,8 +2793,22 @@ class MainWindow(QMainWindow):
             self.backend = BackendTelemetria(force_demo=True)
         elif src == "MAVSDK":
             self.backend = BackendTelemetria(force_demo=False)
+            if hasattr(self.backend, "system_id"):
+                self.backend.system_id = self.spin_mav_system_id.value()
+            if hasattr(self.backend, "component_id"):
+                self.backend.component_id = self.spin_mav_comp_id.value()
+            if hasattr(self.backend, "connection_timeout_s"):
+                self.backend.connection_timeout_s = float(self.spin_mav_timeout.value())
         else:  # LoRa
-            self.backend = LoRaBackend(port=endpoint or "COM3", baud=57600)
+            try:
+                baud = int(self.combo_lora_baud.currentText())
+            except ValueError:
+                baud = 57600
+            self.backend = LoRaBackend(port=endpoint or "COM3", baud=baud)
+            if hasattr(self.backend, "buffer_size"):
+                self.backend.buffer_size = int(self.spin_lora_buffer.value())
+            if hasattr(self.backend, "retry_delay_s"):
+                self.backend.retry_delay_s = float(self.spin_lora_retry_delay.value())
 
         self._start_connecting_animation()
 
@@ -1801,16 +2821,34 @@ class MainWindow(QMainWindow):
     async def _run_backend(self, endpoint: str):
         """
         Corrutina que se encarga de conectar el backend y consumir las muestras.
-        Va emitiendo señales hacia la interfaz con cada muestra.
+        Implementa política de reconexión automática básica.
         """
-        try:
-            await self.backend.connect(endpoint)
-            self._set_connection_status(True, self.source_name)
-            async for sample in self.backend.samples():
-                self.signals.sample.emit(sample)
-        except Exception as e:
-            self._set_connection_status(False, "error")
-            QMessageBox.critical(self, "Error de backend", str(e))
+        attempts = 0
+        while True:
+            try:
+                await self.backend.connect(endpoint)
+                self._set_connection_status(True, self.source_name)
+                attempts = 0
+                async for sample in self.backend.samples():
+                    self.signals.sample.emit(sample)
+                # Si el generador termina sin excepción, lo tratamos como desconexión
+                raise RuntimeError("Enlace finalizado")
+            except Exception as e:
+                self._set_connection_status(False, "error")
+                if not self.auto_reconnect_enabled:
+                    QMessageBox.critical(self, "Error de backend", str(e))
+                    break
+                attempts += 1
+                self._reconnect_attempts = attempts
+                max_attempts = self.reconnect_max_attempts
+                if max_attempts > 0 and attempts > max_attempts:
+                    QMessageBox.critical(
+                        self,
+                        "Error de backend",
+                        f"Fallo de conexión tras {attempts} intentos: {e}",
+                    )
+                    break
+                await asyncio.sleep(self.reconnect_interval_s)
 
     # ------------------------------------------------------------------
     # MANEJO DE TELEMETRÍA ENTRANTE
@@ -1822,9 +2860,14 @@ class MainWindow(QMainWindow):
         - Actualiza buffers de gráficas.
         - Actualiza HUD y estado rápido.
         - Actualiza texto de “Contrato”.
+        - Actualiza mapa de trayectoria.
+        - Aplica alertas y seguridad.
         - Guarda la muestra en la base de datos.
         """
         self.last_sample = s
+
+        # Reset del timeout de enlace (heartbeat)
+        self._reset_link_timeout_timer()
 
         # Tiempo relativo de la muestra
         t_val = getattr(s, "time_s", None)
@@ -1855,6 +2898,13 @@ class MainWindow(QMainWindow):
         lon = getattr(s, "lon_deg", 0.0) or 0.0
         sats = getattr(s, "num_sat", 0) or 0
 
+        roll = getattr(s, "roll_deg", 0.0) or 0.0
+        pitch = getattr(s, "pitch_deg", 0.0) or 0.0
+        yaw = getattr(s, "yaw_deg", 0.0) or 0.0
+        vx = getattr(s, "vx_ms", 0.0) or 0.0
+        vy = getattr(s, "vy_ms", 0.0) or 0.0
+        vz = getattr(s, "vz_ms", 0.0) or 0.0
+
         # Buffers para gráficas
         self.alt_buf.append(alt)
         self.spd_buf.append(spd)
@@ -1863,35 +2913,124 @@ class MainWindow(QMainWindow):
         self.pres_buf.append(pres)
         self.hum_buf.append(hum)
 
-        # --- Dashboard: batería --------------------------------------
+        # --- Dashboard: batería / valores rápidos -------------------
         self.bat_widget.set_level(bat_pct)
         self.lbl_bat_val.setText(f"{vbat:.2f} V" if vbat > 0 else "-- V")
 
-        # Altitud con color según rango
+        self.lbl_alt_val.setText(f"{alt:.1f}")
+        self.lbl_spd_val.setText(f"{spd:.1f}")
+        self.lbl_tmp_val.setText(f"{tmp:.1f}")
+
         t_theme = THEMES[self.current_theme]
+
+        # Batería: color + alertas
+        batt_level = 0
+        if bat_pct <= self.alert_batt_crit_pct:
+            batt_color = t_theme["danger_color"]
+            batt_level = 2
+        elif bat_pct <= self.alert_batt_warn_pct:
+            batt_color = t_theme["warning_color"]
+            batt_level = 1
+        else:
+            batt_color = t_theme["text_main"]
+            batt_level = 0
+
+        self.lbl_bat_val.setStyleSheet(
+            f"color:{batt_color}; font-weight:700; font-size:18px;"
+        )
+
+        if self.alert_enable_batt and batt_level > self.last_batt_alert_level:
+            if batt_level == 1 and self.alert_style == "popup":
+                QMessageBox.warning(
+                    self,
+                    "Batería baja",
+                    f"La batería ha bajado a {bat_pct:.0f}%.",
+                )
+            elif batt_level == 2 and self.alert_style == "popup":
+                QMessageBox.critical(
+                    self,
+                    "Batería crítica",
+                    f"La batería ha bajado a {bat_pct:.0f}%. Aterriza lo antes posible.",
+                )
+        if batt_level == 0 and self.last_batt_alert_level != 0:
+            self.last_batt_alert_level = 0
+        else:
+            self.last_batt_alert_level = max(self.last_batt_alert_level, batt_level)
+
+        # Altitud con umbral máximo
         if alt < 5.0:
             color_alt = t_theme["danger_color"]
-        elif alt > 120.0:
-            color_alt = "#C084FC"
+            alt_over = False
+        elif alt > self.alert_alt_max:
+            color_alt = t_theme["warning_color"]
+            alt_over = True
         else:
             color_alt = t_theme["accent_color"]
+            alt_over = False
 
-        self.lbl_alt_val.setText(f"{alt:.1f}")
         self.lbl_alt_val.setStyleSheet(
             f"color:{color_alt}; font-weight:800; font-size:24px;"
         )
 
-        # Velocidad
-        self.lbl_spd_val.setText(f"{spd:.1f}")
+        if self.alert_enable_alt:
+            if alt_over and not self.alt_alert_active:
+                self.alt_alert_active = True
+                if self.alert_style == "popup":
+                    QMessageBox.warning(
+                        self,
+                        "Altitud alta",
+                        f"Se superó la altitud recomendada de {self.alert_alt_max:.0f} m.",
+                    )
+            elif not alt_over and self.alt_alert_active:
+                self.alt_alert_active = False
+
+        # Velocidad con umbral máximo
+        if hasattr(self, "metric_colors"):
+            base_spd_color = self.metric_colors["spd"]
+        else:
+            base_spd_color = "#00D1FF"
+
+        spd_over = spd > self.alert_spd_max
+        spd_color = t_theme["danger_color"] if spd_over else base_spd_color
         self.lbl_spd_val.setStyleSheet(
-            f"color:{self.metric_colors['spd']}; font-weight:700; font-size:22px;"
+            f"color:{spd_color}; font-weight:700; font-size:22px;"
         )
 
-        # Temperatura
-        self.lbl_tmp_val.setText(f"{tmp:.1f}")
+        if self.alert_enable_spd:
+            if spd_over and not self.spd_alert_active:
+                self.spd_alert_active = True
+                if self.alert_style == "popup":
+                    QMessageBox.warning(
+                        self,
+                        "Velocidad alta",
+                        f"La velocidad ha superado {self.alert_spd_max:.1f} m/s.",
+                    )
+            elif not spd_over and self.spd_alert_active:
+                self.spd_alert_active = False
+
+        # Temperatura con umbral máximo
+        if hasattr(self, "metric_colors"):
+            base_tmp_color = self.metric_colors["tmp"]
+        else:
+            base_tmp_color = "#FF375F"
+
+        temp_over = tmp > self.alert_temp_max
+        tmp_color = t_theme["danger_color"] if temp_over else base_tmp_color
         self.lbl_tmp_val.setStyleSheet(
-            f"color:{self.metric_colors['tmp']}; font-weight:700; font-size:22px;"
+            f"color:{tmp_color}; font-weight:700; font-size:22px;"
         )
+
+        if self.alert_enable_temp:
+            if temp_over and not self.temp_alert_active:
+                self.temp_alert_active = True
+                if self.alert_style == "popup":
+                    QMessageBox.warning(
+                        self,
+                        "Temperatura alta",
+                        f"La temperatura ha superado {self.alert_temp_max:.1f} °C.",
+                    )
+            elif not temp_over and self.temp_alert_active:
+                self.temp_alert_active = False
 
         # Tiempo de vuelo en formato hh:mm:ss
         hrs = int(self.flight_time_s // 3600)
@@ -1899,10 +3038,36 @@ class MainWindow(QMainWindow):
         secs = int(self.flight_time_s % 60)
         self.lbl_flight_time_val.setText(f"{hrs:02d}:{mins:02d}:{secs:02d}")
 
-        # HUD
+        # ------------------ ENERGÍA ESPECÍFICA + FPV ------------------
+        v_mod = sqrt(vx * vx + vy * vy + vz * vz)
+        energia = G0 * alt + 0.5 * v_mod * v_mod
+
+        trend = 0
+        if self.prev_energy is not None:
+            if energia > self.prev_energy + 5.0:
+                trend = 1
+            elif energia < self.prev_energy - 5.0:
+                trend = -1
+        self.prev_energy = energia
+        self.energy_trend = trend
+
+        if v_mod > 0.1:
+            fpv_pitch = atan2(-vz, sqrt(vx * vx + vy * vy)) * 180.0 / pi
+            fpv_yaw = atan2(vy, vx) * 180.0 / pi
+        else:
+            fpv_pitch = pitch
+            fpv_yaw = yaw
+
+        slip_val = 0.0
+
         self.att_widget.set_attitude(
-            getattr(s, "roll_deg", 0.0) or 0.0,
-            getattr(s, "pitch_deg", 0.0) or 0.0,
+            roll,
+            pitch,
+            yaw_deg=yaw,
+            fpv_pitch_deg=fpv_pitch,
+            fpv_yaw_deg=fpv_yaw,
+            slip=slip_val,
+            energy_trend=self.energy_trend,
         )
 
         # Líneas de estado tipo “Contrato”
@@ -1912,12 +3077,33 @@ class MainWindow(QMainWindow):
             f"GPS: {sats} sats | Modo: {modo} | En aire: {en_aire_txt} | Fuente: {self.source_name}"
         )
 
-        accent = THEMES[self.current_theme]["accent_color"]
         self.lbl_status_line2.setText(
-            f"<span style='color:{accent}; font-weight:600;'>Contrato:</span> "
-            f"temp:{tmp:.1f},hum:{hum:.1f},pres:{pres:.1f},rad:{rad:.2f},"
-            f"lat:{lat:.4f},lon:{lon:.4f},speed:{spd:.2f},acc:{acc:.2f},ts:{t_val:.1f}"
+            f"temp:{tmp:.1f},hum:{hum:.1f},pres:{pres:.2f},"
+            f"lat:{lat:.4f},lon:{lon:.4f},speed:{spd:.1f},acc:{acc:.1f}"
         )
+
+        # Alertas basadas en GPS
+        if self.alert_enable_gps:
+            gps_bad = sats < self.alert_gps_min_sats
+            if gps_bad and not self.gps_alert_active:
+                self.gps_alert_active = True
+                if self.alert_style == "popup":
+                    QMessageBox.warning(
+                        self,
+                        "GPS limitado",
+                        f"Se detectan solo {sats} satélites (< {self.alert_gps_min_sats}).",
+                    )
+            elif not gps_bad and self.gps_alert_active:
+                self.gps_alert_active = False
+
+            if gps_bad:
+                self.lbl_status_line1.setStyleSheet(
+                    f"font-size: 12px; color: {t_theme['warning_color']};"
+                )
+            else:
+                self.lbl_status_line1.setStyleSheet(
+                    f"font-size: 12px; color: {THEMES[self.current_theme]['text_main']};"
+                )
 
         # Intensidad de señal (aprox a partir de sats)
         level = 0
@@ -1932,9 +3118,14 @@ class MainWindow(QMainWindow):
         self.signal_widget.set_level(level)
         self.signal_widget_conn.set_level(level)
 
-        # Gráficas
-        self._update_graphs()
+        # Tiempo actual para control de refresco
+        now_ms = time.monotonic() * 1000.0
 
+        # Gráficas
+        if self._should_update_graphs(now_ms):
+            self._update_graphs()
+
+        # Etiquetas bajo las gráficas
         self.lbl_alt_graph_val.setText(f"{alt:.1f} m")
         self.lbl_spd_graph_val.setText(f"{spd:.1f} m/s")
         self.lbl_vbat_graph_val.setText(f"{vbat:.2f} V")
@@ -1942,19 +3133,61 @@ class MainWindow(QMainWindow):
         self.lbl_pres_graph_val.setText(f"{pres:.1f} hPa")
         self.lbl_hum_graph_val.setText(f"{hum:.1f} %")
 
-        # Guardar en BD (flush inmediato para que siempre haya historial)
+        # Mapa / trayectoria
+        if self._should_update_map(now_ms):
+            self._update_map(lat, lon, alt, spd)
+
+        # Guardar en BD
         self.db.append(self.source_name, s)
-        self.db.flush()
+        if self.db_commit_per_sample:
+            self.db.flush()
+
+    def _should_update_graphs(self, now_ms: float) -> bool:
+        """
+        Controla si se deben redibujar las gráficas:
+        - Solo si la pestaña de gráficas está activa.
+        - Respetando el periodo configurado (graph_update_period_ms).
+        """
+        if not hasattr(self, "stack"):
+            return False
+        if self.stack.currentIndex() != 2:
+            return False
+        if self.graph_update_period_ms <= 0:
+            self._last_graph_update_ms = now_ms
+            return True
+        if now_ms - self._last_graph_update_ms >= self.graph_update_period_ms:
+            self._last_graph_update_ms = now_ms
+            return True
+        return False
+
+    def _should_update_map(self, now_ms: float) -> bool:
+        """
+        Controla si se debe redibujar el mapa:
+        - Solo si la pestaña de mapa está activa.
+        - Respetando el periodo configurado (map_update_period_ms).
+        """
+        if not hasattr(self, "stack"):
+            return False
+        if self.stack.currentIndex() != 1:
+            return False
+        if self.map_update_period_ms <= 0:
+            self._last_map_update_ms = now_ms
+            return True
+        if now_ms - self._last_map_update_ms >= self.map_update_period_ms:
+            self._last_map_update_ms = now_ms
+            return True
+        return False
 
     def _update_graphs(self):
         """Actualiza las curvas de las gráficas en la pestaña correspondiente."""
         if self.graph_paused:
             return
+        if not self.time_buf:
+            return
 
-        x = list(self.time_buf)
+        x_full = list(self.time_buf)
 
-        def maybe_smooth(data: deque) -> List[float]:
-            vals = list(data)
+        def apply_smooth(vals: List[float]) -> List[float]:
             if not self.graph_smooth or len(vals) < 5:
                 return vals
             w = 5
@@ -1965,15 +3198,95 @@ class MainWindow(QMainWindow):
                 sm.append(sum(window) / len(window))
             return sm
 
-        self.curve_alt.setData(x, maybe_smooth(self.alt_buf))
-        self.curve_spd.setData(x, maybe_smooth(self.spd_buf))
-        self.curve_vbat.setData(x, maybe_smooth(self.volt_buf))
-        self.curve_tmp.setData(x, maybe_smooth(self.temp_buf))
-        self.curve_pres.setData(x, maybe_smooth(self.pres_buf))
-        self.curve_hum.setData(x, maybe_smooth(self.hum_buf))
+        alt_vals = apply_smooth(list(self.alt_buf))
+        spd_vals = apply_smooth(list(self.spd_buf))
+        vbat_vals = apply_smooth(list(self.volt_buf))
+        tmp_vals = apply_smooth(list(self.temp_buf))
+        pres_vals = apply_smooth(list(self.pres_buf))
+        hum_vals = apply_smooth(list(self.hum_buf))
+
+        step = 1
+        if self.graph_max_points and len(x_full) > self.graph_max_points:
+            step = max(1, len(x_full) // self.graph_max_points)
+
+        x = x_full[::step]
+        alt_y = alt_vals[::step]
+        spd_y = spd_vals[::step]
+        vbat_y = vbat_vals[::step]
+        tmp_y = tmp_vals[::step]
+        pres_y = pres_vals[::step]
+        hum_y = hum_vals[::step]
+
+        if self.graph_enabled.get("alt", True):
+            self.curve_alt.setData(x, alt_y)
+        else:
+            self.curve_alt.clear()
+
+        if self.graph_enabled.get("spd", True):
+            self.curve_spd.setData(x, spd_y)
+        else:
+            self.curve_spd.clear()
+
+        if self.graph_enabled.get("vbat", True):
+            self.curve_vbat.setData(x, vbat_y)
+        else:
+            self.curve_vbat.clear()
+
+        if self.graph_enabled.get("tmp", True):
+            self.curve_tmp.setData(x, tmp_y)
+        else:
+            self.curve_tmp.clear()
+
+        if self.graph_enabled.get("pres", True):
+            self.curve_pres.setData(x, pres_y)
+        else:
+            self.curve_pres.clear()
+
+        if self.graph_enabled.get("hum", True):
+            self.curve_hum.setData(x, hum_y)
+        else:
+            self.curve_hum.clear()
+
+    def _set_map_max_points(self, max_points: int):
+        """Cambia el máximo de puntos de trayectoria en el mapa."""
+        max_points = max(10, int(max_points))
+        self.map_max_points = max_points
+        self.map_positions = deque(self.map_positions, maxlen=self.map_max_points)
+
+    def _update_map(self, lat: float, lon: float, alt: float, spd: float):
+        """
+        Actualiza la página de mapa con la trayectoria:
+        - Guarda posiciones (lat/lon).
+        - Actualiza curva y puntos de home / UAV.
+        - Auto-zoom suave.
+        """
+        if lat == 0.0 and lon == 0.0:
+            return
+
+        if self.map_home is None:
+            self.map_home = (lat, lon)
+
+        self.map_positions.append((lat, lon))
+
+        lats = [p[0] for p in self.map_positions]
+        lons = [p[1] for p in self.map_positions]
+
+        self.map_curve.setData(lons, lats)
+        self.map_uav_spot.setData(x=[lon], y=[lat])
+
+        if self.map_home is not None:
+            home_lat, home_lon = self.map_home
+            self.map_home_spot.setData(x=[home_lon], y=[home_lat])
+
+        if len(self.map_positions) >= 2:
+            self.map_plot.autoRange(padding=0.12)
+
+        self.lbl_map_status.setText(
+            f"Lat: {lat:.5f}  Lon: {lon:.5f}  Alt: {alt:.1f} m  Vel: {spd:.1f} m/s"
+        )
 
     # ------------------------------------------------------------------
-    # CAMBIO DE TEMA (OSC/CLARO)
+    # CAMBIO DE TEMA (OSC/CLARO) + ACENTO
     # ------------------------------------------------------------------
 
     def _toggle_theme(self):
@@ -1994,41 +3307,136 @@ class MainWindow(QMainWindow):
         self.signal_widget_conn.set_theme(self.current_theme)
 
         # Actualizar fondos de gráficas y colores de curvas
-        plots_curves_colors = [
-            (self.plot_alt, self.curve_alt, self.metric_colors["alt"]),
-            (self.plot_spd, self.curve_spd, self.metric_colors["spd"]),
-            (self.plot_vbat, self.curve_vbat, self.metric_colors["vbat"]),
-            (self.plot_tmp, self.curve_tmp, self.metric_colors["tmp"]),
-            (self.plot_pres, self.curve_pres, self.metric_colors["pres"]),
-            (self.plot_hum, self.curve_hum, self.metric_colors["hum"]),
-        ]
-        for plot, curve, color in plots_curves_colors:
-            plot.setBackground(THEMES[self.current_theme]["graph_bg"])
-            curve.setPen(pg.mkPen(color, width=2))
+        if hasattr(self, "metric_colors"):
+            # Altitud toma el color de acento actual
+            self.metric_colors["alt"] = THEMES[self.current_theme]["accent_color"]
+            plots_curves_colors = [
+                (self.plot_alt, self.curve_alt, self.metric_colors["alt"]),
+                (self.plot_spd, self.curve_spd, self.metric_colors["spd"]),
+                (self.plot_vbat, self.curve_vbat, self.metric_colors["vbat"]),
+                (self.plot_tmp, self.curve_tmp, self.metric_colors["tmp"]),
+                (self.plot_pres, self.curve_pres, self.metric_colors["pres"]),
+                (self.plot_hum, self.curve_hum, self.metric_colors["hum"]),
+            ]
+            for plot, curve, color in plots_curves_colors:
+                plot.setBackground(THEMES[self.current_theme]["graph_bg"])
+                curve.setPen(pg.mkPen(color, width=2))
+
+        # Fondo del mapa
+        self.map_plot.setBackground(THEMES[self.current_theme]["graph_bg"])
 
         self.btn_theme.setText(
             "Modo claro" if self.current_theme == "dark" else "Modo oscuro"
         )
 
-        # Actualizar estilos de líneas de estado (Contrato) al cambiar tema
+        # Colores de líneas de estado
         accent = THEMES[self.current_theme]["accent_color"]
         self.lbl_status_line1.setStyleSheet(
             f"font-size: 12px; color: {THEMES[self.current_theme]['text_main']};"
         )
         self.lbl_status_line2.setStyleSheet(
-            f"font-size: 12px; color: {THEMES[self.current_theme]['text_main']};"
+            f"font-size: 12px; color: {accent};"
         )
-        # Forzar re-dibujo de texto “Contrato”
+
         if self.last_sample is not None:
-            self._handle_sample(self.last_sample)
+            s = self.last_sample
+            tmp = getattr(s, "temp_c", 0.0) or 0.0
+            hum = getattr(s, "hum_pct", 0.0) or 0.0
+            pres = getattr(s, "pres_hpa", 0.0) or 0.0
+            lat = getattr(s, "lat_deg", 0.0) or 0.0
+            lon = getattr(s, "lon_deg", 0.0) or 0.0
+            spd = getattr(s, "groundspeed_ms", 0.0) or 0.0
+            acc = getattr(s, "acc_ms2", 0.0) or 0.0
+            modo = getattr(s, "flight_mode", "--") or "--"
+            in_air = bool(getattr(s, "in_air", False))
+            sats = getattr(s, "num_sat", 0) or 0
+            en_aire_txt = "Sí" if in_air else "No"
+            self.lbl_status_line1.setText(
+                f"GPS: {sats} sats | Modo: {modo} | En aire: {en_aire_txt} | Fuente: {self.source_name}"
+            )
+            self.lbl_status_line2.setText(
+                f"temp:{tmp:.1f},hum:{hum:.1f},pres:{pres:.2f},"
+                f"lat:{lat:.4f},lon:{lon:.4f},speed:{spd:.1f},acc:{acc:.1f}"
+            )
+
+        # Actualizar estilo de los toggles de gráficas
+        if hasattr(self, "graph_toggle_buttons"):
+            for key, btn in self.graph_toggle_buttons.items():
+                checked = self.graph_enabled.get(key, True)
+                color = (
+                    THEMES[self.current_theme]["success_color"]
+                    if checked
+                    else THEMES[self.current_theme]["danger_color"]
+                )
+                btn.setStyleSheet(
+                    f"color:{color}; background:transparent; border:none; font-size:16px;"
+                )
+
+    # ------------------------------------------------------------------
+    # HANDLERS CONFIG (acentos, alertas, timeout enlace)
+    # ------------------------------------------------------------------
+
+    def _on_accent_dark_changed(self, name: str):
+        self.accent_choice_dark = name
+        self._apply_accent_to_theme("dark", name)
+        self.settings.setValue("accent_dark", name)
+        if self.current_theme == "dark":
+            self._apply_theme()
+
+    def _on_accent_light_changed(self, name: str):
+        self.accent_choice_light = name
+        self._apply_accent_to_theme("light", name)
+        self.settings.setValue("accent_light", name)
+        if self.current_theme == "light":
+            self._apply_theme()
+
+    def _on_alert_style_changed(self, idx: int):
+        self.alert_style = "ui" if idx == 0 else "popup"
+
+    def _on_link_timeout_changed(self, v: float):
+        self.link_timeout_s = float(v)
+        if self.link_timeout_s <= 0.0:
+            self.link_timeout_timer.stop()
+        else:
+            self.link_timeout_timer.setInterval(int(self.link_timeout_s * 1000))
+
+    def _reset_link_timeout_timer(self):
+        """Reinicia el temporizador de timeout de enlace (heartbeat)."""
+        if self.link_timeout_s <= 0.0:
+            self.link_timeout_timer.stop()
+            return
+        self.link_timeout_timer.setInterval(int(self.link_timeout_s * 1000))
+        self.link_timeout_timer.start()
+        self.link_alert_active = False
+
+    def _on_link_timeout(self):
+        """Se dispara cuando no llega telemetría durante el tiempo configurado."""
+        if not self.alert_enable_link:
+            return
+        if self.link_alert_active:
+            return
+        self.link_alert_active = True
+        self._set_connection_status(False, "timeout")
+        self.signal_widget.set_level(0)
+        self.signal_widget_conn.set_level(0)
+        if self.alert_style == "popup":
+            QMessageBox.warning(
+                self,
+                "Enlace perdido",
+                "No se ha recibido telemetría dentro del tiempo configurado.",
+            )
 
     # ------------------------------------------------------------------
     # CÁMARA: ACTUALIZACIÓN Y CAPTURAS
     # ------------------------------------------------------------------
 
     def _tick_camera(self):
-        """Se llama periódicamente para actualizar el cuadro de la cámara."""
-        active = self.backend is not None
+        """
+        Se llama periódicamente para actualizar el cuadro de la cámara.
+        La cámara solo se anima cuando el Dashboard está visible.
+        """
+        active_backend = self.backend is not None
+        active = active_backend and hasattr(self, "stack") and self.stack.currentIndex() == 0
         self.cam_widget.update_image(active)
 
     def _set_capture_mode(self, mode: str):
@@ -2057,7 +3465,6 @@ class MainWindow(QMainWindow):
             if path:
                 QMessageBox.information(self, "Foto guardada", f"Foto guardada en:\n{path}")
         else:
-            # Modo video
             if not self.is_recording:
                 self.cam_widget.start_recording()
                 self.is_recording = True
@@ -2079,10 +3486,12 @@ class MainWindow(QMainWindow):
         """Asigna una pequeña animación de opacidad a los botones principales."""
         buttons = [
             self.btn_dash,
+            self.btn_map,
             self.btn_graph,
             self.btn_hist,
             self.btn_conn,
             self.btn_theme,
+            self.btn_open_settings_small,
             getattr(self, "btn_pause_graphs", None),
             getattr(self, "btn_smooth_graphs", None),
         ]
@@ -2095,10 +3504,7 @@ class MainWindow(QMainWindow):
             wrap(b)
 
     def _animate_button(self, btn: QPushButton):
-        """
-        Anima ligeramente el botón reduciendo su opacidad y
-        restaurándola después de unos milisegundos.
-        """
+        """Anima ligeramente el botón reduciendo su opacidad un instante."""
         effect = btn.graphicsEffect()
         if not isinstance(effect, QGraphicsOpacityEffect):
             effect = QGraphicsOpacityEffect(btn)
